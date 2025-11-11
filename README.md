@@ -333,7 +333,9 @@ trakt_tv:
 
 For any sensor that allows sorting, the following are the options available
 
-`rating`, `rating_trakt`, `rank`, `released`, `runtime`, `listed_at`
+`rating`, `rating_trakt`, `rank`, `released`, `runtime`, `listed_at`, `last_activity_date`, `trakt`
+
+ - `trakt` sorting is just relying on the order that the trakt api returns the data in.
 
 
 #### Configuration Example
