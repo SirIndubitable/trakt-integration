@@ -129,10 +129,10 @@ class TraktApi:
         except KeyError:
             return False
 
-    async def fetch_watched(
-        self, excluded_shows: list, excluded_finished: bool = False
-    ):
-        """First, let's retrieve hidden items from user as a workaround for a potential bug in show progress_watch API"""
+    async def fetch_hidden_shows(self):
+        """
+        Gets the hidden shows for the current user
+        """
         cache_key = f"user_hidden_shows"
 
         maybe_answer = cache_retrieve(self.cache(), cache_key)
@@ -140,53 +140,68 @@ class TraktApi:
             hidden_shows = maybe_answer
         else:
             hidden_shows = []
-            for section in [
+            hidden_sections = [
                 "calendar",
                 "progress_watched",
                 "progress_watched_reset",
                 "progress_collected",
-            ]:
-                hidden_items = await self.request(
-                    "get", f"users/hidden/{section}?type=show"
-                )
-                if hidden_items is not None:
-                    for hidden_item in hidden_items:
-                        try:
-                            trakt_id = hidden_item["show"]["ids"]["trakt"]
-                            hidden_shows.append(trakt_id)
-                        except IndexError:
-                            LOGGER.error(
-                                "Error while trying to retrieve hidden items in section %s",
-                                section,
-                            )
+            ]
+            hidden_items_lists = await gather(
+                *[
+                    self.request("get", f"users/hidden/{section}?type=show")
+                    for section in hidden_sections
+                ]
+            )
+            hidden_items = [
+                x
+                for xl in hidden_items_lists
+                if xl is not None
+                for x in xl
+                if x is not None
+            ]
+            for hidden_item in hidden_items:
+                try:
+                    trakt_id = hidden_item["show"]["ids"]["trakt"]
+                    hidden_shows.append(trakt_id)
+                except IndexError:
+                    LOGGER.error(
+                        "Error while trying to retrieve the hidden item %s", hidden_item
+                    )
             cache_insert(self.cache(), cache_key, hidden_shows)
+        return hidden_shows
+
+    async def fetch_watched(
+        self, excluded_shows: list, excluded_finished: bool = False
+    ):
+        """First, let's retrieve hidden items from user as a workaround for a potential bug in show progress_watch API"""
+        hidden_shows = await self.fetch_hidden_shows()
 
         """Then, let's retrieve progress for current user by removing hidden or excluded shows"""
         raw_shows = await self.request("get", f"sync/watched/shows?extended=noseasons")
-        raw_medias = []
 
-        for show in raw_shows or []:
+        # Filter excluded shows
+        raw_shows = [
+            show
+            for show in raw_shows
+            if not self.is_show_excluded(show, excluded_shows, hidden_shows)
+        ]
+
+        async def populate_show_next_episode(show):
             try:
                 ids = extract_value_from(show, ["show", "ids"])
                 identifier = extract_value_from(ids, ["slug"])
             except Exception as e:
                 LOGGER.warning(f"Raw show {show} can't be extracted because: {e}")
-                continue
+                return None
 
             try:
-                is_excluded = self.is_show_excluded(show, excluded_shows, hidden_shows)
-
-                if is_excluded:
-                    continue
-
                 trakt_identifier = extract_value_from(ids, ["trakt"])
-
                 raw_show_progress = await self.fetch_show_progress(trakt_identifier)
-                is_finished = self.is_show_finished(raw_show_progress)
 
+                is_finished = self.is_show_finished(raw_show_progress)
                 """aired date and completed date will always be the same for next to watch tvshows if you're up-to-date"""
                 if excluded_finished and is_finished:
-                    continue
+                    return None
 
                 raw_next_episode = await self.fetch_show_informations(
                     trakt_identifier,
@@ -199,21 +214,29 @@ class TraktApi:
                 if raw_next_episode.get("first_aired") is not None:
                     show["first_aired"] = raw_next_episode["first_aired"]
 
-                raw_medias.append(show)
+                return show
             except IndexError:
                 LOGGER.warning(f"Show {identifier} doesn't contain any trakt ID")
-                continue
             except TraktException as e:
                 LOGGER.warning(f"Show {identifier} can't be extracted because: {e}")
-                continue
             except TypeError as e:
                 LOGGER.warning(f"Show {identifier} can't be extracted because: {e}")
-                continue
             except KeyError as e:
                 LOGGER.warning(f"Show {identifier} can't be extracted because: {e}")
-                continue
 
-        return raw_medias
+            return None
+
+        raw_shows = await gather(
+            *[populate_show_next_episode(show) for show in raw_shows]
+        )
+        raw_shows = [show for show in raw_shows if show is not None]
+
+        for show in raw_shows or []:
+            raw_next_episode = extract_value_from(show, ["episode"])
+            if raw_next_episode.get("first_aired") is not None:
+                show["first_aired"] = raw_next_episode["first_aired"]
+
+        return raw_shows
 
     async def fetch_show_progress(self, id: str):
         cache_key = f"show_progress_{id}"
